@@ -501,10 +501,78 @@
     const RHYTHM_PER_DAY = 8;
 
     // ---------- Persistence ----------
-    const LS = {
-      get(k, d) { try { const v = localStorage.getItem('tt:' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-      set(k, v) { try { localStorage.setItem('tt:' + k, JSON.stringify(v)); } catch (e) {} },
+    // View state (folds, window, group filter) used to live in localStorage,
+    // which throws inside this app's opaque-origin iframe — the calls were
+    // guarded, so the app ran and silently remembered nothing. It now lives in
+    // one workspace-wide JSON document: read once at startup into `cache`,
+    // served synchronously from there so callers stay synchronous, and written
+    // back on an idle debounce, because every lucidos.data.write is a git
+    // commit and a burst of band toggles has to coalesce into one.
+    const STATE_PATH = 'artifacts/trigger-timeline/state.json';
+    const SAVE_DEBOUNCE_MS = 500;
+    const Store = {
+      cache: {},
+      ready: null,
+      _timer: null,
+      _writing: false,
+      _rerun: false,
+      _touched: false,
+      _last: null,        // payload already on disk — a no-op flush skips the commit
+
+      get(k, d) {
+        return Object.prototype.hasOwnProperty.call(this.cache, k) ? this.cache[k] : d;
+      },
+      set(k, v) {
+        this.cache[k] = v;
+        this._touched = true;
+        clearTimeout(this._timer);
+        this._timer = setTimeout(() => this.flush(), SAVE_DEBOUNCE_MS);
+      },
+      serialize() { return JSON.stringify(this.cache, null, 2); },
+      hydrate() {
+        this.ready = (async () => {
+          let saved = null;
+          try {
+            saved = JSON.parse(await lucidos.data.read(STATE_PATH));
+          } catch (e) {
+            // No document yet (or an unreadable one) is "no saved state", not an error.
+          }
+          if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+            // Anything set while the read was in flight came from the user, so
+            // it wins over what the file says.
+            this.cache = Object.assign(saved, this.cache);
+          }
+          if (!this._touched) this._last = this.serialize();
+        })();
+        return this.ready;
+      },
+      // Writes are serialised: a set() landing mid-write re-runs the flush
+      // afterwards, so the newest value always reaches the document.
+      async flush() {
+        clearTimeout(this._timer);
+        this._timer = null;
+        if (this._writing) { this._rerun = true; return; }
+        this._writing = true;
+        try {
+          await this.ready;    // never write a half-hydrated cache over the file
+          const payload = this.serialize();
+          if (payload !== this._last) {
+            await lucidos.data.write(STATE_PATH, payload);
+            this._last = payload;
+          }
+        } catch (e) {
+          // Persisting view state is best-effort; the session keeps its cache.
+        } finally {
+          this._writing = false;
+          if (this._rerun) { this._rerun = false; this.flush(); }
+        }
+      },
     };
+    Store.hydrate();
+    // A tab hidden or torn down mid-debounce would otherwise drop the last toggle.
+    const flushPending = () => { if (Store._timer) Store.flush(); };
+    document.addEventListener('visibilitychange', () => { if (document.hidden) flushPending(); });
+    window.addEventListener('pagehide', flushPending);
 
     // ---------- API base detection ----------
     function apiBase() {
@@ -716,18 +784,17 @@
     let OCCURRENCES = [];        // every projected fire {ts, trigger, groupId}
     let RHYTHMS = [], AGENDA = [];
     let EVENT_TRIGGERS = [], PAUSED_TRIGGERS = [], FAILING = [];
-    let WINDOW_H = LS.get('window', 24);
+    // These are the DEFAULTS. The saved view arrives after the first paint
+    // (the state document is read asynchronously), so the app boots on them and
+    // restoreView() below folds the stored values in once they land.
+    let WINDOW_H = 24;
     let QUERY = '';
-    const excluded = new Set(LS.get('excluded', []));
+    const excluded = new Set();
     // Every section folds, and the fold survives a reload. The agenda is a
     // section too, so a workspace that lives in the loop band can shut the
     // per-fire list entirely.
-    const openSec = {
-      rhythms: LS.get('sec.rhythms', true),
-      agenda: LS.get('sec.agenda', true),
-      events: LS.get('sec.events', false),
-      paused: LS.get('sec.paused', false),
-    };
+    const openSec = { rhythms: true, agenda: true, events: false, paused: false };
+    let LOADED = false;           // triggers fetched at least once
     const dayState = {};          // dayKey -> bool (undefined = default)
     const openStacks = new Set(); // ts of expanded same-minute stacks
     const openRhythms = new Set();// trigger id of expanded rhythm rows
@@ -762,6 +829,7 @@
       GROUPS = {};
       for (const g of GROUP_LIST) { GROUPS[g.id] = g; groupColorVar(g.id); }
 
+      LOADED = true;
       project();
       render();
       startTicker();
@@ -952,7 +1020,7 @@
         '<span class="sec-n">' + count + '</span>';
       b.addEventListener('click', () => {
         openSec[key] = !openSec[key];
-        LS.set('sec.' + key, openSec[key]);
+        Store.set('sec.' + key, openSec[key]);
         render();
       });
       return b;
@@ -1069,7 +1137,7 @@
       reset.textContent = 'Show all';
       reset.disabled = !hidden;
       reset.addEventListener('click', () => {
-        excluded.clear(); LS.set('excluded', []); render();
+        excluded.clear(); Store.set('excluded', []); render();
       });
       head.appendChild(reset);
       sheet.appendChild(head);
@@ -1090,7 +1158,7 @@
           'stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
         row.addEventListener('click', () => {
           if (excluded.has(e.id)) excluded.delete(e.id); else excluded.add(e.id);
-          LS.set('excluded', [...excluded]);
+          Store.set('excluded', [...excluded]);
           render();
         });
         sheet.appendChild(row);
@@ -1333,16 +1401,19 @@
     }
 
     // ---------- Controls ----------
-    document.querySelectorAll('#window-seg .segmented-btn').forEach(b => {
-      b.classList.toggle('active', parseInt(b.dataset.h, 10) === WINDOW_H);
-    });
+    function syncWindowSeg() {
+      document.querySelectorAll('#window-seg .segmented-btn').forEach(b => {
+        b.classList.toggle('active', parseInt(b.dataset.h, 10) === WINDOW_H);
+      });
+    }
+    syncWindowSeg();
     document.getElementById('window-seg').addEventListener('click', (e) => {
       const btn = e.target.closest('.segmented-btn');
       if (!btn) return;
       document.querySelectorAll('#window-seg .segmented-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       WINDOW_H = parseInt(btn.dataset.h, 10);
-      LS.set('window', WINDOW_H);
+      Store.set('window', WINDOW_H);
       for (const k in dayState) delete dayState[k];
       project(); render();
     });
@@ -1350,7 +1421,7 @@
     // everything (including individual days), otherwise it reopens.
     document.getElementById('foldall').addEventListener('click', () => {
       const anyOpen = Object.values(openSec).some(Boolean);
-      for (const k in openSec) { openSec[k] = !anyOpen; LS.set('sec.' + k, openSec[k]); }
+      for (const k in openSec) { openSec[k] = !anyOpen; Store.set('sec.' + k, openSec[k]); }
       for (const k in dayState) delete dayState[k];
       openStacks.clear(); openRhythms.clear();
       const btn = document.getElementById('foldall');
@@ -1401,6 +1472,22 @@
       });
     } catch (e) {}
 
+    // ---------- Boot ----------
+    // Both halves start now and settle in either order. The fetch renders the
+    // default view as soon as the triggers are in; the stored view is applied
+    // the moment it lands, and only re-renders if there is already something on
+    // screen — so a load error is never replaced by an empty agenda.
+    function restoreView() {
+      WINDOW_H = Store.get('window', WINDOW_H);
+      const ex = Store.get('excluded', null);
+      if (Array.isArray(ex)) { excluded.clear(); for (const id of ex) excluded.add(id); }
+      for (const k in openSec) openSec[k] = Store.get('sec.' + k, openSec[k]);
+      syncWindowSeg();
+    }
+    Store.ready.then(() => {
+      restoreView();
+      if (LOADED) { project(); render(); }
+    });
     load();
   </script>
 </body>
